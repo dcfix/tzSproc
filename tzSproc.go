@@ -7,6 +7,7 @@ import (
 	"fmt"
 	_ "github.com/denisenkom/go-mssqldb"
 	"log"
+	"strings"
 )
 
 var debug = flag.Bool("debug", false, "enable debugging")
@@ -94,55 +95,188 @@ func makeSqlCode(table Table) string {
 	var buffer bytes.Buffer
 
 	// insert sproc
+	buffer.WriteString("\n-- ******** INSERT ********\n")
 	buffer.WriteString(makeSqlInsert(table))
 
 	// update sproc
+	buffer.WriteString("\n-- ******** UPDATE ********\n")
+	buffer.WriteString(makeSqlUpdate(table))
 
 	// delete sproc
+	buffer.WriteString("\n-- ******** DELETE ********\n")
+	buffer.WriteString(makeSqlDelete(table))
 
 	// select sproc
+	buffer.WriteString("\n-- ******** READ ********\n")
+	buffer.WriteString(makeSqlSelect(table))
 
 	return buffer.String()
 
 }
 
 func makeSqlDropStatement(sprocName string) string {
-	sql := `if exists (select name from sysobjects where name = '%s')
-		drop proc %s
-		go`
+	sql := "if exists (select name from sysobjects where name = '%s')\n\tdrop proc %s\ngo"
 	return fmt.Sprintf(sql, sprocName, sprocName)
+
+}
+
+func makeSqlUpdate(table Table) string {
+	var buffer bytes.Buffer
+
+	parameters := make([]string, 0)
+	fields := make([]string, 0)
+	var whereClause string
+
+	sprocName := fmt.Sprintf("stp_%s_upd", table.name)
+
+	buffer.WriteString(makeSqlDropStatement(sprocName))
+	buffer.WriteString(fmt.Sprintf("\nCREATE proc %s \n", sprocName))
+
+	// print the parameters
+	for _, value := range table.columns {
+		// this is an insert clause, so skip the ones that are an identity column
+		// don't write directly to the buffer - we end up with the
+		// 'too many commas' problem. Simpler to use a strings.join
+		// than to try to remove the last comma.
+		if !value.is_computed {
+			metaData := getMetaData(value)
+			parameters = append(parameters, "\t"+metaData)
+			if !value.is_identity {
+				fields = append(fields, fmt.Sprintf("%s=@%s", value.column_name, value.column_name))
+			} else {
+				whereClause = fmt.Sprintf("\nWHERE %s = @%s", value.column_name, value.column_name)
+			}
+		}
+	}
+
+	buffer.WriteString(strings.Join(parameters, ",\n"))
+
+	buffer.WriteString("\nAS\n")
+
+	buffer.WriteString(fmt.Sprintf("update %s\n", table.name))
+	buffer.WriteString(fmt.Sprintf("SET %s", strings.Join(fields, ", ")))
+	buffer.WriteString(fmt.Sprintf("\n%s", whereClause))
+	buffer.WriteString("\ngo\n")
+	return buffer.String()
+
+}
+
+func makeSqlDelete(table Table) string {
+	var buffer bytes.Buffer
+
+	var parameter string
+	var whereClause string
+
+	sprocName := fmt.Sprintf("stp_%s_del", table.name)
+
+	buffer.WriteString(makeSqlDropStatement(sprocName))
+	buffer.WriteString(fmt.Sprintf("\nCREATE proc %s \n", sprocName))
+
+	// print the parameters
+	for _, value := range table.columns {
+		// this is an insert clause, so skip the ones that are an identity column
+		// don't write directly to the buffer - we end up with the
+		// 'too many commas' problem. Simpler to use a strings.join
+		// than to try to remove the last comma.
+		if value.is_identity {
+			metaData := getMetaData(value)
+			parameter = "\t" + metaData
+			whereClause = fmt.Sprintf("WHERE %s = @%s", value.column_name, value.column_name)
+
+		}
+	}
+
+	buffer.WriteString(parameter)
+
+	buffer.WriteString("\nAS\n")
+
+	buffer.WriteString(fmt.Sprintf("DELETE FROM %s\n", table.name))
+	buffer.WriteString(fmt.Sprintf("\n%s", whereClause))
+	buffer.WriteString("\ngo\n")
+	return buffer.String()
+
+}
+
+func makeSqlSelect(table Table) string {
+	var buffer bytes.Buffer
+
+	fields := make([]string, 0)
+	var parameter string
+	var whereClause string
+
+	sprocName := fmt.Sprintf("stp_%s_sel", table.name)
+
+	buffer.WriteString(makeSqlDropStatement(sprocName))
+	buffer.WriteString(fmt.Sprintf("\nCREATE proc %s \n", sprocName))
+
+	// print the parameters
+	for _, value := range table.columns {
+		// this is an insert clause, so skip the ones that are an identity column
+		// don't write directly to the buffer - we end up with the
+		// 'too many commas' problem. Simpler to use a strings.join
+		// than to try to remove the last comma.
+		if !value.is_computed {
+			if value.is_identity {
+				parameter = getMetaData(value)
+				whereClause = fmt.Sprintf("WHERE %s = @%s", value.column_name, value.column_name)
+			} else {
+				fields = append(fields, fmt.Sprintf("%s", value.column_name))
+			}
+		}
+	}
+
+	buffer.WriteString(fmt.Sprintf("\t%s", parameter))
+	buffer.WriteString("\nAS\n")
+
+	buffer.WriteString(fmt.Sprintf("SELECT %s\n", strings.Join(fields, ", ")))
+	buffer.WriteString(fmt.Sprintf("FROM %s\n", table.name))
+	buffer.WriteString(whereClause)
+	buffer.WriteString("\ngo\n")
+	return buffer.String()
 
 }
 
 func makeSqlInsert(table Table) string {
 	var buffer bytes.Buffer
 
+	parameters := make([]string, 0)
+	fields := make([]string, 0)
+	parms := make([]string, 0) // could be created by manipulating fields, but these are so small it doesn't matter
+	var outputParm string
+	var outputParmName string
+
 	sprocName := fmt.Sprintf("stp_%s_ins", table.name)
 
 	buffer.WriteString(makeSqlDropStatement(sprocName))
 
-	buffer.WriteString(fmt.Sprintf("\nCREATE sproc %s \nAS\n", sprocName))
+	buffer.WriteString(fmt.Sprintf("\nCREATE proc %s \n", sprocName))
 
 	// print the parameters
 	for _, value := range table.columns {
 		// this is an insert clause, so skip the ones that are an identity column
+		// don't write directly to the buffer - we end up with the
+		// 'too many commas' problem. Simpler to use a strings.join
+		// than to try to remove the last comma.
 		if !(value.is_identity || value.is_computed) {
 			metaData := getMetaData(value)
-
-			buffer.WriteString(fmt.Sprintf("%s,\n", metaData))
-
+			parameters = append(parameters, "\t"+metaData)
+			fields = append(fields, value.column_name)
+			parms = append(parms, "@"+value.column_name)
+		} else {
+			if value.is_identity {
+				outputParmName = "@" + value.column_name
+				outputParm = fmt.Sprintf("%s OUTPUT", getMetaData(value))
+			}
 		}
-		// todo: I have to remove the last , from this buffer!
-
-		//	table_name  string
-		//	column_name string
-		//	data_type   string
-		//	max_length  int
-		//	precision   int
-		//	column_id   int
-		//	is_identity bool
-		//	is_computed bool
 	}
+
+	buffer.WriteString(strings.Join(parameters, ",\n"))
+	buffer.WriteString(fmt.Sprintf(",\n\t%s", outputParm))
+	buffer.WriteString("\nAS\n")
+	buffer.WriteString(fmt.Sprintf("insert into %s (%s)\n", table.name, strings.Join(fields, ", ")))
+	buffer.WriteString(fmt.Sprintf("\nVALUES (%s)", strings.Join(parms, ", ")))
+	buffer.WriteString(fmt.Sprintf("\nSET %s = scope_identity()", outputParmName))
+	buffer.WriteString("\ngo\n")
 	return buffer.String()
 
 }
