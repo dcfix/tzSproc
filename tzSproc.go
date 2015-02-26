@@ -7,12 +7,13 @@ import (
 	"fmt"
 	_ "github.com/denisenkom/go-mssqldb"
 	"log"
+	"os"
 	"strings"
 )
 
 var debug = flag.Bool("debug", false, "enable debugging")
 var server = flag.String("server", "fecsql03", "the database server")
-var database = flag.String("database", "internal", "the database ")
+var database = flag.String("database", "Internal", "the database ")
 var table = flag.String("table", "", "the database dataTable")
 var user = flag.String("user", "SPWebProg", "the database user")
 var password = flag.String("password", "", "the user password")
@@ -65,15 +66,33 @@ func getMetaData(column Column) string {
 	return buffer.String()
 }
 
+func check(e error) {
+	if e != nil {
+		panic(e)
+	}
+}
+
 // processDataTable calls the functions that generate the code
 func processDataTable(dataTableName string) {
 	dataTable := loadDataTable(dataTableName)
 
 	sprocs := makeSqlCode(dataTable)
 	class := makeClassCode(dataTable)
+	sprocFile, err := os.Create(fmt.Sprintf("CREATE_%s.sql", dataTableName))
+	check(err)
 
-	fmt.Printf(sprocs)
-	fmt.Printf(class)
+	defer sprocFile.Close()
+
+	_, err = sprocFile.WriteString(sprocs)
+	sprocFile.Sync()
+
+	classFile, err := os.Create(fmt.Sprintf("C:\\client\\Current\\Common\\Internal\\Internal\\%s.cs", dataTableName))
+	check(err)
+	defer classFile.Close()
+
+	_, err = classFile.WriteString(class)
+	classFile.Sync()
+
 }
 
 // loadDataTable grabs the dataTable and column details from the database
@@ -140,18 +159,183 @@ func makeClassCode(dataTable DataTable) string {
 
 	// save code 	-- it decides if it's an insert or update
 	buffer.WriteString(makeClassSave(dataTable))
+
 	// insert code
+	buffer.WriteString(makeClassInsert(dataTable))
 
 	// update code
+	buffer.WriteString(makeClassUpdate(dataTable))
+
+	// load parameters
+	buffer.WriteString(makeClassParameters(dataTable))
 
 	// delete code
+	buffer.WriteString(makeClassDelete(dataTable))
 
-	// read code -- based on identity key
+	// load code -- based on identity key
+	buffer.WriteString(makeClassLoad(dataTable))
 
 	// loadFromRow()
+	buffer.WriteString(makeClassLoadFromRow(dataTable))
 
 	// footer code
 	buffer.WriteString(makeClassFooter())
+	buffer.WriteString(pp(3, fmt.Sprintf("Where is the sutff%s", "?")))
+	return buffer.String()
+}
+
+// makeClassLoadFromRow generates the code to load class from a row
+func makeClassLoadFromRow(dataTable DataTable) string {
+	var buffer bytes.Buffer
+
+	tl := 2
+
+	buffer.WriteString(pp(tl, "public bool loadFromRow(DataRow row)\n"))
+	buffer.WriteString(pp(tl, "{\n"))
+
+	tl = 3
+
+	buffer.WriteString(pp(tl, "bool bResult = false;\n\n"))
+
+	for _, column := range dataTable.columns {
+		buffer.WriteString(pp(tl, getClassDataAssignment(column)))
+	}
+
+	buffer.WriteString(pp(tl, "bResult = true;\n"))
+	buffer.WriteString(pp(tl, "return bResult;\n"))
+	buffer.WriteString(pp(tl-1, "}\n"))
+
+	return buffer.String()
+}
+
+// makeClassLoad selects and loads a record based on the identity field
+func makeClassLoad(dataTable DataTable) string {
+	var buffer bytes.Buffer
+
+	identity := getIdentityField(dataTable)
+	tl := 2
+
+	buffer.WriteString(pp(tl, "public bool Load()\n"))
+	buffer.WriteString(pp(tl, "{\n"))
+
+	tl = 3
+	buffer.WriteString(pp(tl, "bool bResult = false;\n"))
+	buffer.WriteString(pp(tl, "SqlConnection conn = getConnection();\n"))
+	buffer.WriteString(pp(tl, "conn.Open();\n"))
+
+	sproc := fmt.Sprintf("SqlCommand cmd = new SqlCommand(\"stp_%s_sel\", conn);\n", dataTable.name)
+	buffer.WriteString(pp(tl, sproc))
+
+	buffer.WriteString(pp(tl, "cmd.CommandType = CommandType.StoredProcedure;\n"))
+	buffer.WriteString(pp(tl, fmt.Sprintf("cmd.Parameters.AddWithValue(\"@%s\", %s);\n\n", identity, identity)))
+	buffer.WriteString(pp(tl, "DataTable dt = new DataTable();\n"))
+	buffer.WriteString(pp(tl, "dt.Load(cmd.ExecuteReader());\n"))
+	buffer.WriteString(pp(tl, "if (dt.Rows.Count > 0)\n"))
+	buffer.WriteString(pp(tl+1, "bResult = loadFromRow(dt.Rows[0]);\n"))
+	buffer.WriteString(pp(tl, "conn.Close();\n"))
+	buffer.WriteString(pp(tl, "return bResult;\n"))
+	buffer.WriteString(pp(tl, "}\n"))
+
+	return buffer.String()
+}
+
+// makeClassDelete runs the delete sproc
+func makeClassDelete(dataTable DataTable) string {
+	var buffer bytes.Buffer
+
+	identity := getIdentityField(dataTable)
+	parmString := fmt.Sprintf("cmd.Parameters.AddWithValue(\"@%s\", %s);\n", identity, identity)
+
+	tl := 2
+
+	buffer.WriteString(pp(tl, "public void Delete()\n"))
+	buffer.WriteString(pp(tl, "{\n"))
+	tl = 3
+
+	buffer.WriteString(pp(tl, "SqlConnection conn = getConnection();\n"))
+	buffer.WriteString(pp(tl, "conn.Open();\n"))
+
+	buffer.WriteString(pp(tl, fmt.Sprintf("SqlCommand cmd = new SqlCommand(\"stp_%s_del\", conn);\n", dataTable.name)))
+	buffer.WriteString(pp(tl, "cmd.CommandType = CommandType.StoredProcedure;\n\n"))
+	buffer.WriteString(pp(tl, parmString))
+	buffer.WriteString(pp(tl, "cmd.ExecuteNonQuery();\n"))
+
+	buffer.WriteString(pp(tl-1, "}\n\n"))
+
+	return buffer.String()
+}
+
+//makeClassParameters will generate the parameters and append them to your cmd object
+func makeClassParameters(dataTable DataTable) string {
+	var buffer bytes.Buffer
+
+	identity := getIdentityField(dataTable)
+
+	tl := 2
+
+	buffer.WriteString(pp(tl, "private void addParameters(SqlCommand cmd, bool isUpdate = false)\n"))
+	buffer.WriteString(pp(tl, "{\n"))
+
+	tl = 3
+
+	buffer.WriteString(pp(tl, "if (isUpdate)\n"))
+	buffer.WriteString(pp(tl+1, fmt.Sprintf("cmd.Parameters.AddWithValue(\"@%s\", %s);\n", identity, identity)))
+
+	tempText := ""
+	for _, column := range dataTable.columns {
+		// we don't want to process any identity or computedcolumns.
+		if !(column.is_identity || column.is_computed) {
+			tempText = fmt.Sprintf("cmd.Parameters.AddWithValue(\"@%s\", %s);\n", column.column_name, column.column_name)
+			buffer.WriteString(pp(tl, tempText))
+
+		}
+	}
+
+	buffer.WriteString(pp(tl-1, "}\n\n"))
+
+	return buffer.String()
+}
+
+// makeClassInsert will generate the code to call the insert sproc
+func makeClassInsert(dataTable DataTable) string {
+	var buffer bytes.Buffer
+
+	tl := 2
+	buffer.WriteString(pp(tl, "private int Insert()\n"))
+	buffer.WriteString(pp(tl, "{\n"))
+	tl = 3
+	buffer.WriteString(pp(tl, "int iReturn = 0;\n"))
+	buffer.WriteString(pp(tl, "SqlConnection conn = getConnection();\n"))
+	buffer.WriteString(pp(tl, "conn.Open();\n"))
+	buffer.WriteString(pp(tl, fmt.Sprintf("SqlCommand cmd = new SqlCommand(\"stp_%s_ins\", conn);\n", dataTable.name)))
+	buffer.WriteString(pp(tl, "cmd.CommandType = CommandType.StoredProcedure;\n\n"))
+	buffer.WriteString(pp(tl, "addParameters(cmd, false);\n\n"))
+	buffer.WriteString(pp(tl, "iReturn = Convert.ToInt32(cmd.ExecuteScalar());\n"))
+	buffer.WriteString(pp(tl, "return iReturn;\n"))
+
+	buffer.WriteString(pp(tl-1, "}\n\n"))
+
+	return buffer.String()
+}
+
+// makeClassUpdate will generate the code to call the update sproc
+func makeClassUpdate(dataTable DataTable) string {
+	var buffer bytes.Buffer
+
+	tl := 2
+	buffer.WriteString(pp(tl, "private int Update()\n"))
+	buffer.WriteString(pp(tl, "{\n"))
+	tl = 3
+	buffer.WriteString(pp(tl, "int iReturn = 0;\n"))
+	buffer.WriteString(pp(tl, "SqlConnection conn = getConnection();\n"))
+	buffer.WriteString(pp(tl, "conn.Open();\n"))
+	buffer.WriteString(pp(tl, fmt.Sprintf("SqlCommand cmd = new SqlCommand(\"stp_%s_upd\", conn);\n", dataTable.name)))
+	buffer.WriteString(pp(tl, "cmd.CommandType = CommandType.StoredProcedure;\n\n"))
+	buffer.WriteString(pp(tl, "addParameters(cmd, true);\n\n"))
+	buffer.WriteString(pp(tl, "cmd.ExecuteNonQuery();\n"))
+	buffer.WriteString(pp(tl, "return iReturn;\n"))
+
+	buffer.WriteString(pp(tl-1, "}\n\n"))
 
 	return buffer.String()
 }
@@ -199,7 +383,6 @@ func makeClassSave(dataTable DataTable) string {
 	buffer.WriteString(pp(tl, "public int Save()\n"))
 	buffer.WriteString(pp(tl, "{\n"))
 
-	buffer.WriteString(pp(tl, "public int Save()\n"))
 	tl = 3
 
 	buffer.WriteString(pp(tl, "int iReturn = 0;\n"))
@@ -235,13 +418,36 @@ func makeClassSave(dataTable DataTable) string {
 func makeClassFooter() string {
 	var buffer bytes.Buffer
 
-	buffer.WriteString("\t\tpublic SqlConnection getConnection()\n\t\t\n")
+	buffer.WriteString("\t\tpublic SqlConnection getConnection() {\n\t\t\n")
 	buffer.WriteString("\t\t\t")
 	buffer.WriteString(fmt.Sprintf(`SqlConnection conn = Database.getSqlConnection("%s");`, *database))
-	buffer.WriteString("\t\t\treturn conn;\n")
+	buffer.WriteString("\n\t\t\treturn conn;\n")
 	buffer.WriteString("\t\t}\n")
+	buffer.WriteString("\t}\n}")
 
 	return buffer.String()
+}
+
+// getClassDataTypeDefault returns the varialbe initilizer
+func getClassDataAssignment(column Column) string {
+	name := column.column_name
+	switch column.data_type {
+	case "char", "varchar", "nvarchar", "nchar":
+		return fmt.Sprintf("%s = row[\"%s\"].ToString();\n", name, name)
+	case "text":
+		return fmt.Sprintf("%s = row[\"%s\"].ToString();\n", name, name)
+	case "smallint", "int", "bigint":
+		return fmt.Sprintf("%s = Convert.ToInt32(row[\"%s\"]);\n", name, name)
+	case "datetime", "smalldatetime":
+		return fmt.Sprintf("%s = Convert.ToDateTime(row[\"%s\"].ToString());\n", name, name)
+	case "bit":
+		return fmt.Sprintf("%s = Convert.ToBoolean(row[\"%s\"].ToString());\n", name, name)
+	case "decimal", "numeric":
+		return fmt.Sprintf("%s = Convert.ToDecimal(row[\"%s\"].ToString());\n", name, name)
+	case "float":
+		return fmt.Sprintf("%s = Convert.ToFloat(row[\"%s\"].ToString());\n", name, name)
+	}
+	return ""
 }
 
 // getClassDataTypeDefault returns the varialbe initilizer
@@ -261,10 +467,8 @@ func getClassDataTypeDefault(column Column) string {
 		return "0.0"
 	case "float":
 		return "0.0"
-
 	}
 	return "string.Empty"
-
 }
 
 // getClassDataType returns the C# data type for a sql data type
@@ -326,12 +530,10 @@ func makeClassGetSets(dataTable DataTable) string {
 func makeClassHeader(dataTable DataTable) string {
 	var buffer bytes.Buffer
 
-	tl := "\t"
-
 	buffer.WriteString("using System;\nusing System.Collections.Generic;\nusing System.Data;\n")
-	buffer.WriteString("using System.Data.SqlClient;\nusing FECUtil;\n")
+	buffer.WriteString("using System.Data.SqlClient;\nusing FECUtil;\n\n")
 
-	buffer.WriteString(fmt.Sprintf("namespace %s\n", *database))
+	buffer.WriteString(fmt.Sprintf("namespace %s {\n", *database))
 
 	functionDoc := fmt.Sprintf("this class is used for all common functionality for a record in the\n\t/// %s dataTable in the %s database on the %s server\n", *table, *database, *server)
 
@@ -346,6 +548,9 @@ func makeClassHeader(dataTable DataTable) string {
 // makeSqlCode generates the code for Sql Server sprocs
 func makeSqlCode(dataTable DataTable) string {
 	var buffer bytes.Buffer
+
+	// write the use clause
+	buffer.WriteString(fmt.Sprintf("use %s\n\n", *database))
 
 	// insert sproc
 	buffer.WriteString("\n-- ******** INSERT ********\n")
@@ -393,6 +598,11 @@ func makeSqlUpdate(dataTable DataTable) string {
 		if !value.is_computed {
 			metaData := getMetaData(value)
 			parameters = append(parameters, "\t"+metaData)
+			if !value.is_identity {
+				fields = append(fields, fmt.Sprintf("%s = @%s", value.column_name, value.column_name))
+			} else {
+				whereClause = fmt.Sprintf("WHERE %s = @%s", value.column_name, value.column_name)
+			}
 		}
 	}
 
